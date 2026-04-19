@@ -1,0 +1,82 @@
+# Reusable semantic-release workflow.
+#
+# Runs inside ghcr.io/hagzag/tools so no Node/npm install is needed.
+# If the calling repo has no .releaserc.yml, a default GitHub-flavoured
+# config is written before semantic-release runs.
+#
+# Usage in a calling repo:
+#
+#   jobs:
+#     release:
+#       uses: hagzag/reusable-actions/.github/workflows/release.yml@main
+#       secrets:
+#         github-token: ${{ secrets.GITHUB_TOKEN }}
+#
+# To override the default .releaserc.yml, commit your own to the repo root.
+# See .releaserc.yml and .releaserc-gitlab.yml in this repo for examples.
+
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      tools-image:
+        description: ghcr.io/hagzag/tools tag to use
+        type: string
+        default: ghcr.io/hagzag/tools:latest
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+    secrets:
+      github-token:
+        description: GitHub token with contents:write and packages:read
+        required: true
+
+jobs:
+  release:
+    name: semantic-release
+    runs-on: ${{ inputs.runs-on }}
+    container:
+      image: ${{ inputs.tools-image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.github-token }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.github-token }}
+
+      # If the calling repo has no .releaserc.yml, write the default
+      # GitHub-flavoured config from this reusable-actions repo.
+      - name: Write default .releaserc.yml if absent
+        run: |
+          if [ ! -f .releaserc.yml ] && [ ! -f .releaserc.json ] && [ ! -f release.config.js ]; then
+            echo "No release config found — writing default .releaserc.yml"
+            cat > .releaserc.yml << 'EOF'
+          branches:
+            - main
+            - name: dev
+              prerelease: true
+          plugins:
+            - "@semantic-release/commit-analyzer"
+            - "@semantic-release/release-notes-generator"
+            - "@semantic-release/changelog"
+            - "@semantic-release/git"
+            - - "@semantic-release/exec"
+              - verifyReleaseCmd: "echo ${nextRelease.version} > nextVersion"
+            - "@semantic-release/github"
+          EOF
+          else
+            echo "Using existing release config:"
+            ls -1 .releaserc.yml .releaserc.json release.config.js 2>/dev/null || true
+          fi
+
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.github-token }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          semantic-release

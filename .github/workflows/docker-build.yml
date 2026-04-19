@@ -1,0 +1,147 @@
+# Reusable Docker build + push workflow.
+#
+# Builds a multi-arch image (linux/amd64 + linux/arm64), pushes to GHCR,
+# and optionally runs a grype vulnerability scan using ghcr.io/hagzag/tools.
+#
+# Usage in a calling repo:
+#
+#   jobs:
+#     docker:
+#       uses: hagzag/reusable-actions/.github/workflows/docker-build.yml@main
+#       secrets:
+#         github-token: ${{ secrets.GITHUB_TOKEN }}
+#
+# Optional inputs let callers override image name, context path, platforms,
+# and whether to run the grype scan step.
+
+name: docker-build
+
+on:
+  workflow_call:
+    inputs:
+      tools-image:
+        description: ghcr.io/hagzag/tools tag to use for scan step
+        type: string
+        default: ghcr.io/hagzag/tools:latest
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+      image-name:
+        description: "Target image name (default: ghcr.io/<owner>/<repo>)"
+        type: string
+        default: ""
+      context:
+        description: Docker build context path
+        type: string
+        default: "."
+      dockerfile:
+        description: Path to Dockerfile
+        type: string
+        default: "Dockerfile"
+      platforms:
+        description: Comma-separated list of target platforms
+        type: string
+        default: "linux/amd64,linux/arm64"
+      scan:
+        description: Run grype vulnerability scan after build
+        type: boolean
+        default: true
+      fail-on:
+        description: Minimum severity to fail the scan (negligible/low/medium/high/critical)
+        type: string
+        default: high
+    secrets:
+      github-token:
+        description: GitHub token with contents:write and packages:write
+        required: true
+    outputs:
+      image:
+        description: Full image reference pushed (name:tag)
+        value: ${{ jobs.build.outputs.image }}
+      digest:
+        description: Image digest (sha256:...)
+        value: ${{ jobs.build.outputs.digest }}
+
+jobs:
+  build:
+    name: build and push
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        id: image-name
+        run: |
+          name="${{ inputs.image-name }}"
+          if [ -z "$name" ]; then
+            name="ghcr.io/${{ github.repository_owner }}/$(echo '${{ github.repository }}' | cut -d/ -f2)"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image-name.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.github-token }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.image-name.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ steps.image-name.outputs.name }}:buildcache,mode=max
+
+  scan:
+    name: grype scan
+    needs: build
+    if: inputs.scan
+    runs-on: ${{ inputs.runs-on }}
+    container:
+      image: ${{ inputs.tools-image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.github-token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run grype
+        run: |
+          args="--fail-on ${{ inputs.fail-on }}"
+          if [ -f .grype.yaml ]; then
+            args="$args --config .grype.yaml"
+            echo "Using .grype.yaml ignore policy"
+          fi
+          # shellcheck disable=SC2086
+          grype "${{ needs.build.outputs.image }}" $args
